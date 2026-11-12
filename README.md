@@ -42,9 +42,13 @@ A plain-language assistant for PayPal payments. It warns you before a payment ge
 - [Architecture](#-architecture)
 - [Project Structure](#-project-structure)
 - [Getting Started](#-getting-started)
+- [Environment Variables](#-environment-variables)
 - [API Reference](#-api-reference)
+- [Testing](#-testing)
 - [Security & Privacy](#-security--privacy)
 - [Deployment](#-deployment)
+- [Known Limits](#-known-limits)
+- [More Documents](#-more-documents)
 - [Roadmap](#-roadmap)
 - [License](#-license)
 - [Disclaimer](#-disclaimer)
@@ -202,6 +206,7 @@ Use these built-in sample IDs in the "Why is it stuck?" panel, or click the exam
 |---|---|
 | `DEMO-UNCLAIMED` | Unclaimed payment |
 | `DEMO-ECHECK` | Pending eCheck |
+| `DEMO-MANUAL` | Pending, needs manual acceptance |
 | `DEMO-COMPLETED` | Completed payment |
 
 Demo scenarios are tagged **"Recorded sandbox response"** because some stuck states, eCheck in particular, are hard to produce live in the sandbox. Real lookups need valid sandbox credentials and a real payout ID.
@@ -311,6 +316,8 @@ git clone https://github.com/rimavishw/paywise-ai.git
 cd paywise-ai
 ```
 
+If you want accounts, saved recipients and simulated transactions, also run [`docs/schema.sql`](docs/schema.sql) in the Supabase SQL editor.
+
 ### 2. Backend
 
 ```bash
@@ -320,13 +327,14 @@ cp ../.env.example .env   # then fill in your values
 ```
 
 ```env
-# Supabase (optional)
+# Supabase (optional, needed for accounts and transactions)
 SUPABASE_URL=your_supabase_url
+SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_SECRET_KEY=your_supabase_secret_key
 
 # Gemini (optional)
 GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-2.0-flash
+GEMINI_MODEL=gemini-3.5-flash-lite
 
 # PayPal Sandbox
 PAYPAL_CLIENT_ID=your_paypal_client_id
@@ -364,16 +372,163 @@ Open **http://localhost:5173**
 
 ---
 
+## ⚙️ Environment Variables
+
+| Name | Required | Used for |
+|---|---|---|
+| `SUPABASE_URL` | for accounts | Supabase project URL |
+| `SUPABASE_ANON_KEY` | for accounts | Sign-up and login |
+| `SUPABASE_SECRET_KEY` | for accounts | Server-side database access. Keep it on the backend only |
+| `PAYPAL_CLIENT_ID` | yes | PayPal sandbox app client ID |
+| `PAYPAL_SECRET` | yes | PayPal sandbox app secret |
+| `PAYPAL_BASE_URL` | no | Defaults to `https://api-m.sandbox.paypal.com` |
+| `GEMINI_API_KEY` | no | Without it, explanations use the hand-written text |
+| `GEMINI_MODEL` | no | Defaults to `gemini-3.5-flash-lite`. Pick a model that answers within the 3 second limit |
+| `PORT` | no | Defaults to `5050`. Render sets this itself |
+| `VITE_API_URL` | no | Frontend only (`frontend/.env`): backend base URL |
+
+The Supabase values are only needed for accounts, saved recipients and simulated transactions. The pre-send check and payment explanation work without them.
+
+---
+
 ## 🔌 API Reference
+
+All bodies and responses are JSON. Routes marked **Auth** need the header `Authorization: Bearer <access_token>`, where the token comes from `POST /api/auth/login`.
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | Backend status |
 | `GET` | `/health` | Health check |
 | `GET` | `/api/health` | API health check |
+| `GET` | `/api/db-test` | Test Supabase connectivity |
 | `POST` | `/api/check` | Run a pre-send payment risk check |
 | `GET` | `/api/payments/:id/explain` | Fetch and explain a payment's status |
-| `GET` | `/api/db-test` | Test Supabase connectivity |
+
+### Health
+
+| Method | Path | Response |
+|---|---|---|
+| GET | `/` | `{ "message": "PayWise AI Backend is running!", "status": "success" }` |
+| GET | `/health` | `{ "status": "ok" }` |
+| GET | `/api/health` | `{ "status": "healthy", "service": "PayWise AI" }` |
+| GET | `/api/db-test` | 200 if Supabase is reachable, 500 with the error message if not |
+
+### Pre-send check
+
+`POST /api/check` (no auth, 10 requests per minute)
+
+| Field | Required | Rules |
+|---|---|---|
+| `recipientEmail` | yes | valid email, at most 254 characters |
+| `amount` | yes | 0.01 to 60000, at most 2 decimals |
+| `currency` | yes | one of `USD EUR GBP INR MXN CAD AUD` |
+| `fundingMethod` | yes | `balance`, `card` or `bank` |
+| `balance` | no | sender's balance; enables the balance check |
+| `senderCountry`, `recipientCountry` | no | both needed for the cross-border check |
+
+```bash
+curl -X POST http://localhost:5050/api/check -H "Content-Type: application/json" -d '{"recipientEmail":"friend@gmial.com","amount":"25.00","currency":"USD","fundingMethod":"bank"}'
+```
+
+```json
+{
+  "verdict": "high",
+  "reasons": [
+    { "code": "EMAIL_TYPO_DOMAIN", "level": "high", "suggestion": "friend@gmail.com" },
+    { "code": "FUNDING_BANK_ECHECK", "level": "medium" }
+  ],
+  "skipped": ["CROSS_BORDER"]
+}
+```
+
+Reason codes: `EMAIL_TYPO_DOMAIN` (high), `FUNDING_BANK_ECHECK`, `AMOUNT_OVER_BALANCE`, `CROSS_BORDER` (medium). `skipped` lists checks that could not run because optional fields were missing. The verdict is `high` if any reason is high, `medium` if there is any reason at all, otherwise `low`.
+
+Errors: `400` `{ "error": { "code": "validation_error", "fields": [{ "field": "amount", "code": "invalid_amount" }] } }`, `429` `{ "error": { "code": "rate_limited" } }`.
+
+### Payment explanation
+
+`GET /api/payments/:id/explain` (no auth, 10 requests per minute)
+
+`:id` is a PayPal payout batch ID (8–36 letters, digits or hyphens) or one of the demo IDs below.
+
+```json
+{
+  "paymentId": "DEMO-UNCLAIMED",
+  "status": "UNCLAIMED",
+  "reasonCode": "UNCLAIMED",
+  "statusLabel": "Unclaimed",
+  "explanation": "The recipient hasn't claimed it. They may have no PayPal account under this email.",
+  "senderSteps": ["Confirm the address. Unclaimed money returns to you after 30 days."],
+  "recipientSteps": ["Sign up or log in with this exact email to claim it."],
+  "source": "fallback",
+  "recorded": true,
+  "fetchedAt": "2026-11-12T10:00:00.000Z"
+}
+```
+
+- `source` is `ai` when Gemini reworded the text and `fallback` when the hand-written text was used.
+- `recorded` is `true` for demo IDs and `false` for a live PayPal lookup.
+- `status` is one of `COMPLETED`, `UNCLAIMED`, `ONHOLD`, `PENDING`, `OTHER`.
+
+Demo IDs (work without PayPal credentials): `DEMO-UNCLAIMED`, `DEMO-ECHECK`, `DEMO-MANUAL`, `DEMO-COMPLETED`.
+
+Errors: `400` `validation_error` (bad ID format), `404` `not_found` (PayPal has no such payout), `429` `rate_limited`, `502` `paypal_unreachable` (PayPal credentials or API problem).
+
+### Accounts
+
+| Method | Path | Auth | Body | Success |
+|---|---|---|---|---|
+| POST | `/api/auth/signup` | no | `full_name`, `email`, `password` (8+ characters) | 201 with `user`, `session` |
+| POST | `/api/auth/login` | no | `email`, `password` | 200 with `user`, `session` (`session.access_token` is the bearer token) |
+| GET | `/api/auth/me` | yes | – | 200 with `user`, `profile` |
+
+### Recipients
+
+| Method | Path | Auth | Body | Success |
+|---|---|---|---|---|
+| GET | `/api/recipients` | yes | – | 200 with `recipients` |
+| POST | `/api/recipients` | yes | `name`, `email` | 201 with `recipient` |
+| DELETE | `/api/recipients/:id` | yes | – | 200, or 404 if it is not yours |
+
+### Transactions (simulated)
+
+| Method | Path | Auth | Body | Success |
+|---|---|---|---|---|
+| POST | `/api/transactions` | yes | `recipient_email`, `amount` (number), `currency` (default `USD`), `note` | 201 with `preflight`, `transaction` |
+| GET | `/api/transactions` | yes | – | 200 with `transactions` |
+| GET | `/api/transactions/:id` | yes | – | 200 with `transaction`, or 404 |
+| GET | `/api/events/transaction/:transactionId` | yes | – | 200 with `events`, or 404 |
+
+`POST /api/transactions` runs a pre-flight check against the sender's profile (saved recipient, verification, sandbox balance). If the check blocks the payment the response is `422` with `status: "blocked"` and the `preflight` details. No real money moves: every transaction is stored with `is_simulated: true`.
+
+These account, recipient and transaction routes answer errors as `{ "status": "error", "message": "..." }`, and `401` when the token is missing or invalid.
+
+---
+
+## 🧪 Testing
+
+Smoke test for every endpoint (plain Node, no test framework):
+
+```bash
+cd backend
+node scripts/smoke.js
+```
+
+Against a deployed backend:
+
+```bash
+node scripts/smoke.js https://your-service.onrender.com
+```
+
+Set `TEST_EMAIL` and `TEST_PASSWORD` to an existing test user to also run the signed-in flow (profile, recipients, a simulated transaction, events). The check and payments routes allow 10 requests per minute, so wait a minute between runs.
+
+PayPal sandbox check – gets a token, creates a 1.00 USD fake-money payout to a sandbox account, then looks it up directly and through the app:
+
+```bash
+node scripts/paypalSandbox.js sandbox-receiver@example.com http://localhost:5050
+```
+
+The script refuses to run against anything but the PayPal sandbox. The sandbox app needs the **Payouts** feature switched on (developer.paypal.com → Apps & Credentials → your app → Features).
 
 ---
 
@@ -383,7 +538,7 @@ Open **http://localhost:5173**
 - 🖥️ PayPal and Gemini are called from the backend only.
 - ✅ All inputs are validated on the client and again on the server.
 - 🚦 Rate limited to 10 requests per minute per IP.
-- 🙈 No account, login or tracking cookies.
+- 🙈 No login needed for the two main panels, and no tracking cookies. Accounts are optional.
 - 🤖 Only the PayPal status and reason code are sent to Gemini, with no email or name attached.
 - 🧪 Sandbox only. No real money moves, and PayWise never sends or receives payments.
 
@@ -402,6 +557,30 @@ Open **http://localhost:5173**
 | AI | Google Gemini |
 
 Set `VITE_API_URL` on Vercel to your Render backend URL, and add the backend `.env` values in Render's environment settings.
+
+### Backend on Render (step by step)
+
+1. In Render choose **New → Web Service** and connect this repository.
+2. Settings: root directory `backend`, build command `npm install`, start command `npm start`, health check path `/health`. (`render.yaml` holds the same settings if you prefer **New → Blueprint**.)
+3. Add the environment variables from the table above. Do not set `PORT`.
+4. Deploy, then run the smoke test against the Render URL.
+5. Point the frontend at it by setting `VITE_API_URL` to the Render URL.
+
+---
+
+## ⚠️ Known Limits
+
+- CORS is open to every origin. Restrict it to the frontend's address before real use.
+- The rate limiter and the explanation cache live in memory, so they reset on restart and are per server instance.
+- Only PayPal payout batches can be looked up, and only in the sandbox.
+- Transactions are simulated; the app never sends money.
+
+---
+
+## 📚 More Documents
+
+- [Database schema](docs/schema.sql)
+- Product requirements, technical requirements and build workflow PDFs are in [`docs/`](docs/)
 
 ---
 

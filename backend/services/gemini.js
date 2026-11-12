@@ -1,7 +1,7 @@
 // Gemini only rewrites the sentence. It never decides status, causes or steps.
 async function rewrite(baseText, statusLabel) {
   if (!process.env.GEMINI_API_KEY) return null;
-  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3000);
   try {
